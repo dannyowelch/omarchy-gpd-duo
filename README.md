@@ -21,13 +21,19 @@ On a Duo whose main screen is still unrotated, the background service applies **
 omarchy plugin add https://github.com/dannyowelch/omarchy-gpd-duo.git --enable
 ```
 
-While developing locally, the plugin already lives at:
+The git repo is `~/Projects/omarchy-gpd-duo`. Omarchy loads plugins from a separate live copy:
 
 ```
 ~/.config/omarchy/plugins/io.github.dannyowelch.gpd-duo/
 ```
 
-Saved files reload automatically. Force rediscovery with:
+After editing the repo, install into that live path:
+
+```sh
+./install-local.sh
+```
+
+Saved files in the live plugin directory reload automatically. Force rediscovery with:
 
 ```sh
 omarchy-shell shell rescanPlugins
