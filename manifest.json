@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.dannyowelch.gpd-duo",
+  "name": "GPD Duo",
+  "version": "0.1.0",
+  "author": "dannyowelch",
+  "license": "MIT",
+  "description": "Display layouts for the GPD Duo: stacked dual screens, or lower-only.",
+  "kinds": ["bar-widget", "service"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "GPD Duo",
+    "description": "GPD Duo display layouts",
+    "category": "Hardware",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

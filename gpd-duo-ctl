@@ -1,0 +1,451 @@
+#!/usr/bin/env bash
+# Display layouts for the GPD Duo. Touch and stylus mapping are out of scope.
+
+set -euo pipefail
+
+PLUGIN_ID="io.github.dannyowelch.gpd-duo"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy"
+STATE_FILE="$STATE_DIR/gpd-duo.json"
+MONITORS_LUA="${XDG_CONFIG_HOME:-$HOME/.config}/hypr/monitors.lua"
+LAYOUT_TOGGLE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/toggles/hypr/gpd-duo-layout.lua"
+
+usage() {
+  cat <<USAGE
+Usage: gpd-duo-ctl <detect|status|apply|save|boot> [mode]
+
+Modes: dual, lower
+
+The lid display only works while the main (lower) panel is enabled,
+so upper-only and tablet layouts are not offered.
+USAGE
+}
+
+fail() {
+  echo "gpd-duo-ctl: $*" >&2
+  exit 1
+}
+
+need() {
+  command -v "$1" >/dev/null || fail "missing $1"
+}
+
+dmi() {
+  cat "/sys/class/dmi/id/$1" 2>/dev/null || true
+}
+
+monitors_json() {
+  hyprctl monitors all -j
+}
+
+is_stargate() {
+  local mons="$1"
+  jq -e '
+    any(.[];
+      ((.make // "") | test("Stargate"; "i"))
+      or ((.description // "") | test("Stargate"; "i"))
+    )
+  ' <<<"$mons" >/dev/null
+}
+
+is_duo() {
+  local vendor product mons
+  vendor=$(dmi sys_vendor)
+  product=$(dmi product_name)
+  mons=$(monitors_json)
+
+  if [[ $vendor == GPD && $product == G1622* ]]; then
+    return 0
+  fi
+  if [[ $vendor == GPD ]] && is_stargate "$mons"; then
+    return 0
+  fi
+  jq -e 'any(.[]; .name | test("^(eDP|LVDS|DSI)-"))' <<<"$mons" >/dev/null \
+    && is_stargate "$mons"
+}
+
+pick_lower() {
+  jq -c '
+    [.[] | select(.name | test("^(eDP|LVDS|DSI)-"))] | .[0] // null
+  '
+}
+
+pick_upper() {
+  local mons="$1"
+  local stargate
+  stargate=$(jq -c '
+    [.[] | select(
+      ((.make // "") | test("Stargate"; "i"))
+      or ((.description // "") | test("Stargate"; "i"))
+    )] | .[0] // null
+  ' <<<"$mons")
+  if [[ $stargate != null ]]; then
+    echo "$stargate"
+    return
+  fi
+  jq -c '
+    [.[] | select(.name | test("^DP-"))] | .[0] // null
+  ' <<<"$mons"
+}
+
+monitor_view() {
+  jq -c 'if . == null then null else {
+    name, make, description,
+    transform, scale, width, height,
+    refreshRate, x, y, disabled, focused
+  } end'
+}
+
+format_refresh() {
+  awk -v r="$1" 'BEGIN {
+    n = r + 0
+    i = int(n + 0.5)
+    if ((n - i) < 0.05 && (i - n) < 0.05) printf "%d", i
+    else printf "%g", n
+  }'
+}
+
+logical_size() {
+  local width="$1" height="$2" scale="$3" transform="$4"
+  awk -v w="$width" -v h="$height" -v s="$scale" -v t="$transform" 'BEGIN {
+    if (s <= 0) s = 1
+    lw = int(w / s + 0.5)
+    lh = int(h / s + 0.5)
+    if (t == 1 || t == 3 || t == 5 || t == 7) {
+      tmp = lw; lw = lh; lh = tmp
+    }
+    printf "%d %d", lw, lh
+  }'
+}
+
+infer_mode() {
+  local lower="$1" upper="$2"
+  jq -nr --argjson lower "$lower" --argjson upper "$upper" '
+    def on($m): $m != null and (($m.disabled // false) | not);
+    if on($lower) and (on($upper) | not) then "lower"
+    elif on($lower) and on($upper) then "dual"
+    else "unknown"
+    end
+  '
+}
+
+read_state() {
+  if [[ -f $STATE_FILE ]]; then
+    cat "$STATE_FILE"
+  else
+    echo '{}'
+  fi
+}
+
+write_state() {
+  local last="$1" saved="$2"
+  mkdir -p "$STATE_DIR"
+  jq -n --arg last "$last" --arg saved "$saved" \
+    '{version:1, lastMode:$last, savedMode:$saved}' >"$STATE_FILE"
+}
+
+detect_payload() {
+  local mons vendor product family lower upper
+  vendor=$(dmi sys_vendor)
+  product=$(dmi product_name)
+  family=$(dmi product_family)
+  mons=$(monitors_json)
+  lower=$(pick_lower <<<"$mons" | monitor_view)
+  upper=$(pick_upper "$mons" | monitor_view)
+
+  jq -n \
+    --argjson isDuo "$(is_duo && echo true || echo false)" \
+    --arg vendor "$vendor" \
+    --arg product "$product" \
+    --arg family "$family" \
+    --argjson lower "$lower" \
+    --argjson upper "$upper" \
+    '{isDuo:$isDuo, vendor:$vendor, product:$product, family:$family, lower:$lower, upper:$upper}'
+}
+
+status_payload() {
+  local detect mode last saved
+  detect=$(detect_payload)
+  mode=$(infer_mode "$(jq -c '.lower' <<<"$detect")" "$(jq -c '.upper' <<<"$detect")")
+  last=$(jq -r '.lastMode // ""' <<<"$(read_state)")
+  saved=$(jq -r '.savedMode // ""' <<<"$(read_state)")
+  jq -n \
+    --argjson detect "$detect" \
+    --arg mode "$mode" \
+    --arg lastMode "$last" \
+    --arg savedMode "$saved" \
+    '$detect + {mode:$mode, lastMode:$lastMode, savedMode:$savedMode, saved:($savedMode != "" and $savedMode == $lastMode and $lastMode == $mode)}'
+}
+
+write_layout_overlay() {
+  local body="$1"
+  mkdir -p "$(dirname "$LAYOUT_TOGGLE")"
+  cat >"$LAYOUT_TOGGLE" <<EOF
+-- Overlay written by ${PLUGIN_ID}. Loaded after ~/.config/hypr/monitors.lua.
+$body
+EOF
+  hyprctl reload >/dev/null
+}
+
+wait_for_mode() {
+  local expected="$1"
+  local i detect mode
+  for i in 1 2 3 4 5 6 7 8; do
+    detect=$(detect_payload)
+    mode=$(infer_mode "$(jq -c '.lower' <<<"$detect")" "$(jq -c '.upper' <<<"$detect")")
+    if [[ $mode == "$expected" ]]; then
+      return 0
+    fi
+    sleep 0.15
+  done
+  return 1
+}
+
+geometry() {
+  local mon="$1"
+  local width height refresh scale transform
+  width=$(jq -r '.width' <<<"$mon")
+  height=$(jq -r '.height' <<<"$mon")
+  refresh=$(format_refresh "$(jq -r '.refreshRate' <<<"$mon")")
+  scale=$(jq -r '.scale' <<<"$mon")
+  transform=$(jq -r '.transform' <<<"$mon")
+  if [[ $width == null || $width -le 0 ]]; then
+    width=2880
+    height=1800
+    refresh=60
+  fi
+  if [[ $scale == null || $scale == 0 ]]; then
+    scale=2
+  else
+    scale=$(awk -v s="$scale" 'BEGIN { printf "%g", s + 0 }')
+  fi
+  echo "$width" "$height" "$refresh" "$scale" "$transform"
+}
+
+apply_mode() {
+  local requested="$1"
+  local detect lower upper
+  detect=$(detect_payload)
+  jq -e '.isDuo == true' <<<"$detect" >/dev/null || fail "this machine is not a GPD Duo"
+  lower=$(jq -c '.lower' <<<"$detect")
+  upper=$(jq -c '.upper' <<<"$detect")
+  [[ $lower != null ]] || fail "could not find the lower display (eDP)"
+  [[ $upper != null ]] || fail "could not find the upper display (Stargate / DP)"
+
+  local lname uname
+  local lw lh lr ls lt
+  local uw uh ur us ut
+  lname=$(jq -r '.name' <<<"$lower")
+  uname=$(jq -r '.name' <<<"$upper")
+  read -r lw lh lr ls lt <<<"$(geometry "$lower")"
+  read -r uw uh ur us ut <<<"$(geometry "$upper")"
+
+  local scale
+  scale=$(awk -v a="$ls" -v b="$us" 'BEGIN { s = a + 0; if (s <= 0) s = b + 0; if (s <= 0) s = 2; printf "%g", s }')
+
+  local lmode umode
+  lmode="${lw}x${lh}@${lr}"
+  umode="${uw}x${uh}@${ur}"
+
+  local stack_y overlay
+  read -r _ stack_y <<<"$(logical_size "$lw" "$lh" "$scale" 2)"
+
+  # hyprctl eval cannot re-enable a disabled output under Omarchy's Lua
+  # parser. Write a toggle overlay (sourced after monitors.lua) and reload.
+  case "$requested" in
+    dual)
+      overlay=$(
+        lua_monitor "$lname" false "$lmode" "0x0" "$scale" 2
+        lua_monitor "$uname" false "$umode" "0x-${stack_y}" "$scale" 0
+      )
+      ;;
+    lower)
+      overlay=$(
+        lua_monitor "$lname" false "$lmode" "0x0" "$scale" 2
+        lua_monitor "$uname" true
+      )
+      ;;
+    upper|tablet)
+      fail "mode '$requested' is disabled: the lid display only works while the main panel is on"
+      ;;
+    *)
+      fail "unknown mode '$requested' (dual, lower)"
+      ;;
+  esac
+
+  write_layout_overlay "$overlay"
+  if ! wait_for_mode "$requested"; then
+    fail "failed to apply $requested (lid display did not reach the expected state)"
+  fi
+
+  local saved
+  saved=$(jq -r '.savedMode // ""' <<<"$(read_state)")
+  write_state "$requested" "$saved"
+  status_payload
+}
+
+lua_monitor() {
+  local name="$1" disabled="$2"
+  if [[ $disabled == true ]]; then
+    printf 'hl.monitor({ output = "%s", disabled = true })\n' "$name"
+    return
+  fi
+  local mode="$3" position="$4" scale_var="$5" transform="${6:-}"
+  local extra=""
+  if [[ -n $transform && $transform != 0 ]]; then
+    extra=$(printf ', transform = %s' "$transform")
+  fi
+  printf 'hl.monitor({ output = "%s", mode = "%s", position = "%s", scale = %s%s })\n' \
+    "$name" "$mode" "$position" "$scale_var" "$extra"
+}
+
+lua_other_monitors() {
+  local mons="$1" lower_name="$2" upper_name="$3" scale_var="$4"
+  local mon name disabled width height refresh scale transform x y mode pos
+  while IFS= read -r mon; do
+    [[ -n $mon ]] || continue
+    name=$(jq -r '.name' <<<"$mon")
+    disabled=$(jq -r '.disabled // false' <<<"$mon")
+    if [[ $disabled == true ]]; then
+      lua_monitor "$name" true
+      continue
+    fi
+    width=$(jq -r '.width' <<<"$mon")
+    height=$(jq -r '.height' <<<"$mon")
+    refresh=$(format_refresh "$(jq -r '.refreshRate' <<<"$mon")")
+    scale=$(jq -r '.scale' <<<"$mon")
+    transform=$(jq -r '.transform // 0' <<<"$mon")
+    x=$(jq -r '.x' <<<"$mon")
+    y=$(jq -r '.y' <<<"$mon")
+    mode="${width}x${height}@${refresh}"
+    pos="${x}x${y}"
+    if [[ $scale == null || $scale == 0 ]]; then
+      lua_monitor "$name" false "$mode" "$pos" "$scale_var" "$transform"
+    else
+      printf 'hl.monitor({ output = "%s", mode = "%s", position = "%s", scale = %s' \
+        "$name" "$mode" "$pos" "$scale"
+      if [[ $transform != 0 ]]; then
+        printf ', transform = %s' "$transform"
+      fi
+      printf ' })\n'
+    fi
+  done < <(jq -c --arg lower "$lower_name" --arg upper "$upper_name" '
+    .[] | select(.name != $lower and .name != $upper)
+  ' <<<"$mons")
+}
+
+save_layout() {
+  local detect mode last
+  detect=$(detect_payload)
+  jq -e '.isDuo == true' <<<"$detect" >/dev/null || fail "this machine is not a GPD Duo"
+  last=$(jq -r '.lastMode // ""' <<<"$(read_state)")
+  mode=$(infer_mode "$(jq -c '.lower' <<<"$detect")" "$(jq -c '.upper' <<<"$detect")")
+  if [[ $last == dual || $last == lower ]]; then
+    mode=$last
+  fi
+  [[ $mode == dual || $mode == lower ]] || fail "could not infer a layout to save; apply dual or lower first"
+
+  # Re-apply so live Hyprland and the file agree, then persist.
+  apply_mode "$mode" >/dev/null
+
+  detect=$(detect_payload)
+  local lower upper lname uname mons
+  lower=$(jq -c '.lower' <<<"$detect")
+  upper=$(jq -c '.upper' <<<"$detect")
+  lname=$(jq -r '.name' <<<"$lower")
+  uname=$(jq -r '.name' <<<"$upper")
+  mons=$(monitors_json)
+
+  local lw lh lr ls lt
+  local uw uh ur us ut
+  read -r lw lh lr ls lt <<<"$(geometry "$lower")"
+  read -r uw uh ur us ut <<<"$(geometry "$upper")"
+  local scale
+  scale=$(awk -v a="$ls" -v b="$us" 'BEGIN { s = a + 0; if (s <= 0) s = b + 0; if (s <= 0) s = 2; printf "%g", s }')
+  local gdk
+  gdk=$(awk -v s="$scale" 'BEGIN { printf "%d", int(s + 0.5) }')
+  local stack_y
+  read -r _ stack_y <<<"$(logical_size "$lw" "$lh" "$scale" 2)"
+
+  local l_disabled u_disabled l_transform u_transform l_pos u_pos
+  case "$mode" in
+    dual)
+      l_disabled=false; u_disabled=false
+      l_transform=2; u_transform=0
+      l_pos="0x0"; u_pos="0x-${stack_y}"
+      ;;
+    lower)
+      l_disabled=false; u_disabled=true
+      l_transform=2; u_transform=0
+      l_pos="0x0"; u_pos="0x0"
+      ;;
+    *)
+      fail "cannot save mode '$mode'"
+      ;;
+  esac
+
+  mkdir -p "$(dirname "$MONITORS_LUA")"
+  if [[ -f $MONITORS_LUA ]]; then
+    cp -a "$MONITORS_LUA" "$MONITORS_LUA.bak.$(date +%s)"
+  fi
+
+  {
+    cat <<EOF
+-- Written by ${PLUGIN_ID}. Use the GPD Duo plugin to change layouts.
+-- A timestamped backup of the previous file is kept next to this one.
+
+local omarchy_gdk_scale = ${gdk}
+local omarchy_monitor_scale = ${scale}
+
+hl.env("GDK_SCALE", tostring(omarchy_gdk_scale))
+EOF
+    lua_monitor "$lname" "$l_disabled" "${lw}x${lh}@${lr}" "$l_pos" "omarchy_monitor_scale" "$l_transform"
+    lua_monitor "$uname" "$u_disabled" "${uw}x${uh}@${ur}" "$u_pos" "omarchy_monitor_scale" "$u_transform"
+    extra=$(lua_other_monitors "$mons" "$lname" "$uname" "omarchy_monitor_scale")
+    if [[ -n $extra ]]; then
+      printf '\n-- Other displays present when this layout was saved.\n'
+      printf '%s\n' "$extra"
+    fi
+  } >"$MONITORS_LUA"
+
+  write_state "$mode" "$mode"
+  status_payload
+}
+
+boot() {
+  is_duo || exit 0
+  local detect lower transform last saved
+  detect=$(detect_payload)
+  lower=$(jq -c '.lower' <<<"$detect")
+  [[ $lower != null ]] || exit 0
+  transform=$(jq -r '.transform // 0' <<<"$lower")
+  saved=$(jq -r '.savedMode // ""' <<<"$(read_state)")
+  last=$(jq -r '.lastMode // ""' <<<"$(read_state)")
+
+  # First-run only: the main OLED is physically inverted. If the user has
+  # already picked a layout, leave Hyprland and monitors.lua alone.
+  if [[ -z $saved && -z $last ]]; then
+    if jq -e '.disabled | not' <<<"$lower" >/dev/null && [[ $transform != 2 ]]; then
+      apply_mode dual >/dev/null
+    fi
+  fi
+}
+
+need hyprctl
+need jq
+
+cmd="${1:-}"
+case "$cmd" in
+  detect) detect_payload | jq -c . ;;
+  status) status_payload | jq -c . ;;
+  apply)
+    [[ -n ${2:-} ]] || fail "apply requires a mode"
+    apply_mode "$2" | jq -c .
+    ;;
+  save) save_layout | jq -c . ;;
+  boot) boot ;;
+  -h|--help) usage ;;
+  *)
+    usage >&2
+    exit 1
+    ;;
+esac
