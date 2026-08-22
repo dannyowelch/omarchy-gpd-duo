@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""Own the GPD Duo touchpad volume/brightness strips.
+
+The SP3105FT keyboard node is a consumer-control array, not a typing
+keyboard. Omarchy's global XF86 binds treat some of those usages as
+microphone mute/volume. Grab the node and map slider motion to speaker
+volume and display brightness instead.
+"""
+
+from __future__ import annotations
+
+import glob
+import json
+import os
+import subprocess
+import sys
+import time
+
+try:
+    from evdev import InputDevice, ecodes
+except ImportError:
+    sys.stderr.write("gpd-duo-sliderd: python-evdev is required\n")
+    sys.exit(1)
+
+STATE_FILE = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+    "omarchy",
+    "gpd-duo.json",
+)
+
+VOLUME_UP_KEYS = {
+    ecodes.KEY_VOLUMEUP,
+    ecodes.KEY_SCROLLUP,
+    ecodes.KEY_RIGHT,
+}
+VOLUME_DOWN_KEYS = {
+    ecodes.KEY_VOLUMEDOWN,
+    ecodes.KEY_SCROLLDOWN,
+    ecodes.KEY_LEFT,
+}
+MUTE_KEYS = {ecodes.KEY_MUTE}
+# KEY_F20 is XF86AudioMicMute on the evdev xkb map. Swallow it so this
+# device cannot drive the microphone.
+SWALLOW_KEYS = {
+    getattr(ecodes, "KEY_F20", 190),
+    getattr(ecodes, "KEY_MICMUTE", 248),
+}
+BRIGHTNESS_UP_KEYS = {ecodes.KEY_BRIGHTNESSUP}
+BRIGHTNESS_DOWN_KEYS = {ecodes.KEY_BRIGHTNESSDOWN}
+
+# The volume strip is HID "AC Pan" (horizontal wheel). Continuous finger
+# motion arrives as small REL_HWHEEL_HI_RES deltas; 120 is one detent and
+# is far too coarse for a strip.
+HIRES_PER_PERCENT = 18
+LOG_FILE = os.path.join(os.path.dirname(STATE_FILE), "gpd-duo-sliderd.log")
+LOG_LIMIT = 80
+
+
+def sliders_enabled() -> bool:
+    try:
+        with open(STATE_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return True
+    value = data.get("touchpadSliders")
+    if isinstance(value, bool):
+        return value
+    return True
+
+
+def find_device() -> InputDevice | None:
+    for path in sorted(glob.glob("/dev/input/event*")):
+        try:
+            dev = InputDevice(path)
+        except OSError:
+            continue
+        name = dev.name or ""
+        if "SP3105" in name and "Keyboard" in name:
+            return dev
+        try:
+            dev.close()
+        except OSError:
+            pass
+    return None
+
+
+def spawn(argv: list[str]) -> None:
+    try:
+        subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        sys.stderr.write(f"gpd-duo-sliderd: {argv[0]}: {exc}\n")
+
+
+def volume_adjust(percent: int) -> None:
+    if percent == 0:
+        return
+    if percent > 0:
+        spawn(["omarchy-audio-output-volume", f"+{percent}"])
+    else:
+        spawn(["omarchy-audio-output-volume", f"{percent}"])
+
+
+def volume_raise() -> None:
+    spawn(["omarchy-audio-output-volume", "raise"])
+
+
+def volume_lower() -> None:
+    spawn(["omarchy-audio-output-volume", "lower"])
+
+
+def volume_mute() -> None:
+    spawn(["omarchy-audio-output-volume", "mute-toggle"])
+
+
+def brightness_up() -> None:
+    spawn(["omarchy-brightness-display", "+5%"])
+
+
+def brightness_down() -> None:
+    spawn(["omarchy-brightness-display", "5%-"])
+
+
+def handle_key(code: int, value: int, enabled: bool) -> None:
+    if value == 0:
+        return
+    if code in SWALLOW_KEYS:
+        return
+    if not enabled:
+        return
+    if code in VOLUME_UP_KEYS:
+        volume_adjust(1)
+    elif code in VOLUME_DOWN_KEYS:
+        volume_adjust(-1)
+    elif code in MUTE_KEYS:
+        volume_mute()
+    elif code in BRIGHTNESS_UP_KEYS:
+        brightness_up()
+    elif code in BRIGHTNESS_DOWN_KEYS:
+        brightness_down()
+
+
+def event_name(event) -> str:
+    try:
+        return ecodes.bytype[event.type][event.code]
+    except (KeyError, AttributeError):
+        return str(event.code)
+
+
+def log_event(line: str, remaining: list[int]) -> None:
+    if remaining[0] <= 0:
+        return
+    remaining[0] -= 1
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+
+
+def run_device(dev: InputDevice) -> None:
+    sys.stderr.write(f"gpd-duo-sliderd: grabbed {dev.path} ({dev.name})\n")
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        with open(LOG_FILE, "w", encoding="utf-8") as fh:
+            fh.write(f"grabbed {dev.path} {dev.name}\n")
+    except OSError:
+        pass
+    dev.grab()
+    hires_accum = 0
+    report_hires = 0
+    report_coarse = 0
+    remaining = [LOG_LIMIT]
+    try:
+        for event in dev.read_loop():
+            enabled = sliders_enabled()
+            if event.type == ecodes.EV_SYN and event.code == ecodes.SYN_REPORT:
+                if enabled:
+                    perc = int(hires_accum / HIRES_PER_PERCENT)
+                    hires_accum -= perc * HIRES_PER_PERCENT
+                    if perc != 0:
+                        volume_adjust(perc)
+                    elif report_coarse != 0:
+                        volume_raise() if report_coarse > 0 else volume_lower()
+                else:
+                    hires_accum = 0
+                report_hires = 0
+                report_coarse = 0
+                continue
+            if event.type in (ecodes.EV_KEY, ecodes.EV_REL, ecodes.EV_ABS):
+                log_event(
+                    f"{event.type}:{event_name(event)}={event.value} enabled={int(enabled)}",
+                    remaining,
+                )
+            if event.type == ecodes.EV_KEY:
+                handle_key(event.code, event.value, enabled)
+            elif event.type == ecodes.EV_REL:
+                if event.code == ecodes.REL_HWHEEL_HI_RES:
+                    report_hires += event.value
+                    hires_accum += event.value
+                elif event.code == ecodes.REL_HWHEEL:
+                    report_coarse += event.value
+    finally:
+        try:
+            dev.ungrab()
+        except OSError:
+            pass
+        try:
+            dev.close()
+        except OSError:
+            pass
+
+
+def main() -> int:
+    while True:
+        dev = find_device()
+        if dev is None:
+            time.sleep(2)
+            continue
+        try:
+            run_device(dev)
+        except OSError as exc:
+            sys.stderr.write(f"gpd-duo-sliderd: {exc}\n")
+            time.sleep(1)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

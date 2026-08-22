@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Display layouts for the GPD Duo. Touch and stylus mapping are out of scope.
+# Display layouts and touchpad slider control for the GPD Duo.
+# Touch and stylus mapping are out of scope.
 
 set -euo pipefail
 
@@ -8,12 +9,14 @@ STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy"
 STATE_FILE="$STATE_DIR/gpd-duo.json"
 MONITORS_LUA="${XDG_CONFIG_HOME:-$HOME/.config}/hypr/monitors.lua"
 LAYOUT_TOGGLE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/toggles/hypr/gpd-duo-layout.lua"
+SLIDERS_TOGGLE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/toggles/hypr/gpd-duo-sliders.lua"
 
 usage() {
   cat <<USAGE
-Usage: gpd-duo-ctl <detect|status|apply|save|boot> [mode]
+Usage: gpd-duo-ctl <detect|status|apply|save|boot|sliders> [arg]
 
-Modes: dual, lower
+Layout modes: dual, lower
+Sliders: on, off, toggle
 
 The lid display only works while the main (lower) panel is enabled,
 so upper-only and tablet layouts are not offered.
@@ -139,8 +142,85 @@ read_state() {
 write_state() {
   local last="$1" saved="$2"
   mkdir -p "$STATE_DIR"
-  jq -n --arg last "$last" --arg saved "$saved" \
-    '{version:1, lastMode:$last, savedMode:$saved}' >"$STATE_FILE"
+  jq -n --argjson current "$(read_state)" --arg last "$last" --arg saved "$saved" \
+    '$current + {version:1, lastMode:$last, savedMode:$saved}' >"$STATE_FILE"
+}
+
+write_sliders_state() {
+  local enabled="$1"
+  mkdir -p "$STATE_DIR"
+  jq --argjson sliders "$enabled" '. + {version:1, touchpadSliders:$sliders}' \
+    <<<"$(read_state)" >"$STATE_FILE"
+}
+
+# jq's // treats false as missing, so default only when the key is absent.
+sliders_from_state() {
+  jq -c 'if (.touchpadSliders | type) == "boolean" then .touchpadSliders else true end' \
+    <<<"$(read_state)"
+}
+
+# The lower OLED touchpad exposes brightness/volume strips as a sibling
+# keyboard (SP3105FT … Keyboard). Hyprland names it like
+# sp3105ft:00-0911:5288-keyboard. The "-keyboard-1" pointer is not this.
+slider_keyboard() {
+  hyprctl devices -j | jq -r '
+    [.keyboards[] | .name | select(test("^sp3105ft:.*-keyboard$"))]
+    | .[0] // empty
+  '
+}
+
+write_sliders_overlay() {
+  local name="$1"
+  mkdir -p "$(dirname "$SLIDERS_TOGGLE")"
+  cat >"$SLIDERS_TOGGLE" <<EOF
+-- Overlay written by ${PLUGIN_ID}. Loaded after ~/.config/hypr/input.lua.
+-- Slider keys are owned by gpd-duo-sliderd, not Omarchy's XF86 binds.
+hl.device({ name = "${name}", keybinds = false })
+EOF
+}
+
+eval_slider_keybinds() {
+  local name="$1"
+  hyprctl eval "hl.device({ name = \"${name}\", keybinds = false })" >/dev/null
+}
+
+apply_sliders() {
+  local requested="$1"
+  local detect name current next
+  detect=$(detect_payload)
+  jq -e '.isDuo == true' <<<"$detect" >/dev/null || fail "this machine is not a GPD Duo"
+  name=$(slider_keyboard)
+  [[ -n $name ]] || fail "could not find the touchpad slider keyboard (SP3105FT)"
+
+  current=$(sliders_from_state)
+  case "$requested" in
+    true|on|enable|enabled) next=true ;;
+    false|off|disable|disabled) next=false ;;
+    toggle)
+      if [[ $current == true ]]; then next=false; else next=true; fi
+      ;;
+    *)
+      fail "unknown sliders state '$requested' (on, off, toggle)"
+      ;;
+  esac
+
+  write_sliders_overlay "$name"
+  write_sliders_state "$next"
+  eval_slider_keybinds "$name" || fail "failed to apply touchpad slider keybinds"
+  status_payload
+}
+
+boot_sliders() {
+  local sliders name
+  jq -e '.touchpadSliders | type == "boolean"' <<<"$(read_state)" >/dev/null || return 0
+  name=$(slider_keyboard)
+  [[ -n $name ]] || return 0
+  # Re-read immediately before write so a concurrent toggle is not overwritten
+  # by a stale value captured at service start.
+  sliders=$(jq -c '.touchpadSliders' <<<"$(read_state)")
+  [[ $(jq -r 'type' <<<"$sliders") == boolean ]] || return 0
+  write_sliders_overlay "$name"
+  eval_slider_keybinds "$name" || true
 }
 
 detect_payload() {
@@ -163,17 +243,28 @@ detect_payload() {
 }
 
 status_payload() {
-  local detect mode last saved
+  local detect mode last saved sliders slider_dev
   detect=$(detect_payload)
   mode=$(infer_mode "$(jq -c '.lower' <<<"$detect")" "$(jq -c '.upper' <<<"$detect")")
   last=$(jq -r '.lastMode // ""' <<<"$(read_state)")
   saved=$(jq -r '.savedMode // ""' <<<"$(read_state)")
+  sliders=$(sliders_from_state)
+  slider_dev=$(slider_keyboard)
   jq -n \
     --argjson detect "$detect" \
     --arg mode "$mode" \
     --arg lastMode "$last" \
     --arg savedMode "$saved" \
-    '$detect + {mode:$mode, lastMode:$lastMode, savedMode:$savedMode, saved:($savedMode != "" and $savedMode == $lastMode and $lastMode == $mode)}'
+    --argjson touchpadSliders "$sliders" \
+    --arg sliderDevice "$slider_dev" \
+    '$detect + {
+      mode:$mode,
+      lastMode:$lastMode,
+      savedMode:$savedMode,
+      saved:($savedMode != "" and $savedMode == $lastMode and $lastMode == $mode),
+      touchpadSliders:$touchpadSliders,
+      sliderDevice:(if $sliderDevice == "" then null else $sliderDevice end)
+    }'
 }
 
 write_layout_overlay() {
@@ -428,6 +519,8 @@ boot() {
       apply_mode dual >/dev/null
     fi
   fi
+
+  boot_sliders
 }
 
 need hyprctl
@@ -442,6 +535,10 @@ case "$cmd" in
     apply_mode "$2" | jq -c .
     ;;
   save) save_layout | jq -c . ;;
+  sliders)
+    [[ -n ${2:-} ]] || fail "sliders requires on, off, or toggle"
+    apply_sliders "$2" | jq -c .
+    ;;
   boot) boot ;;
   -h|--help) usage ;;
   *)

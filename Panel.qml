@@ -29,6 +29,10 @@ Panel {
     return Model.modes()
   }
   readonly property string currentMode: status.mode || "unknown"
+  readonly property bool slidersAvailable: status.isDuo && status.sliderDevice !== ""
+  readonly property int slidersIndex: modes.length
+  readonly property int cursorCount: slidersAvailable ? modes.length + 1 : modes.length
+  readonly property bool slidersHasCursor: cursorActive && selectedIndex === slidersIndex
   readonly property color contentForeground: bar ? bar.foreground : Color.foreground
   readonly property string contentFontFamily: bar ? bar.fontFamily : Style.font.family
 
@@ -68,22 +72,38 @@ Panel {
     actionProc.running = true
   }
 
+  function setSliders(mode) {
+    if (root.busy || !root.slidersAvailable) return
+    root.lastError = ""
+    root.busy = true
+    actionProc.command = [root.ctl, "sliders", String(mode || "toggle")]
+    actionProc.running = true
+  }
+
+  function toggleSliders() {
+    setSliders("toggle")
+  }
+
   function ingest(raw) {
     root.status = Model.parseStatus(raw)
     var idx = Model.modeIndex(root.status.lastMode || root.status.mode)
     if (!root.cursorActive) root.selectedIndex = idx
+    if (root.selectedIndex > root.cursorCount - 1)
+      root.selectedIndex = Math.max(0, root.cursorCount - 1)
   }
 
   function moveCursor(delta) {
     var next = selectedIndex + delta
     if (next < 0) next = 0
-    if (next > modes.length - 1) next = modes.length - 1
+    if (next > cursorCount - 1) next = cursorCount - 1
     selectedIndex = next
     cursorActive = true
   }
 
   function activateCursor() {
-    if (selectedIndex >= 0 && selectedIndex < modes.length)
+    if (selectedIndex === slidersIndex && root.slidersAvailable)
+      toggleSliders()
+    else if (selectedIndex >= 0 && selectedIndex < modes.length)
       applyMode(modes[selectedIndex].id)
   }
 
@@ -258,6 +278,42 @@ Panel {
 
         Column {
           width: parent.width
+          spacing: Style.space(10)
+          visible: root.slidersAvailable
+          opacity: root.busy ? 0.55 : 1.0
+
+          PanelSectionHeader {
+            text: "TOUCHPAD"
+            foreground: root.contentForeground
+            fontFamily: root.contentFontFamily
+          }
+
+          Toggle {
+            width: parent.width
+            label: "Touchpad sliders"
+            description: "Brightness and volume strips on the lower touchpad."
+            checked: root.status.touchpadSliders
+            hasCursor: root.slidersHasCursor
+            foreground: root.contentForeground
+            accent: Color.accent
+            fontFamily: root.contentFontFamily
+            onHovered: function(h) {
+              if (h) {
+                root.cursorActive = true
+                root.selectedIndex = root.slidersIndex
+              }
+            }
+            onClicked: if (!root.busy) root.toggleSliders()
+          }
+        }
+
+        PanelSeparator {
+          visible: root.slidersAvailable
+          foreground: root.contentForeground
+        }
+
+        Column {
+          width: parent.width
           spacing: Style.space(6)
           visible: root.status.isDuo
 
@@ -311,7 +367,7 @@ Panel {
           width: parent.width
           visible: root.status.isDuo
           wrapMode: Text.WordWrap
-          text: "Display layouts only. Touch and stylus mapping are not handled yet."
+          text: "Touch and stylus mapping are not handled yet."
           color: Qt.darker(root.contentForeground, 1.4)
           font.family: root.contentFontFamily
           font.pixelSize: Style.font.caption

@@ -9,7 +9,9 @@ function emptyStatus() {
     mode: "unknown",
     lastMode: "",
     savedMode: "",
-    saved: false
+    saved: false,
+    touchpadSliders: true,
+    sliderDevice: ""
   }
 }
 
@@ -28,6 +30,8 @@ function parseStatus(raw) {
     status.lastMode = parsed.lastMode || ""
     status.savedMode = parsed.savedMode || ""
     status.saved = parsed.saved === true
+    status.touchpadSliders = parsed.touchpadSliders !== false
+    status.sliderDevice = parsed.sliderDevice || ""
     return status
   } catch (e) {
     return status

@@ -66,6 +66,11 @@ BarWidget {
       return "ok"
     }
 
+    function sliders(mode: string): string {
+      if (panelLoader.item) panelLoader.item.setSliders(mode)
+      return "ok"
+    }
+
     function refresh(): void {
       if (panelLoader.item) panelLoader.item.refresh()
     }
@@ -82,7 +87,7 @@ BarWidget {
     anchors.fill: parent
     bar: root.bar
     text: "󰍺"
-    tooltipText: "GPD Duo display"
+    tooltipText: "GPD Duo"
     onPressed: function(b) {
       if (b === Qt.RightButton) {
         if (panelLoader.item) panelLoader.item.saveLayout()
