@@ -21,6 +21,13 @@ Panel {
   property string lastError: ""
   property int selectedIndex: 0
   property bool cursorActive: false
+  property bool loginFixOpen: false
+  property bool loginFixConfirming: false
+  property bool loginFixRunning: false
+  property bool loginFixSucceeded: false
+  property real loginFixProgress: 0
+  property string loginFixLabel: ""
+  property string loginFixError: ""
 
   // Re-read on refresh so a Model.js change is not stuck behind a cached import.
   property int layoutRevision: 0
@@ -82,6 +89,67 @@ Panel {
 
   function toggleSliders() {
     setSliders("toggle")
+  }
+
+  function resetLoginFix() {
+    root.loginFixConfirming = false
+    root.loginFixRunning = false
+    root.loginFixSucceeded = false
+    root.loginFixProgress = 0
+    root.loginFixLabel = ""
+    root.loginFixError = ""
+  }
+
+  function handleLoginFixLine(line) {
+    var progress = Model.parseProgressLine(line)
+    if (progress) {
+      if (progress.pct >= root.loginFixProgress) root.loginFixProgress = progress.pct
+      if (progress.label) root.loginFixLabel = progress.label
+      return
+    }
+    var err = String(line || "").trim()
+    if (err.indexOf("gpd-duo-ctl: ") === 0)
+      root.loginFixError = err.replace(/^gpd-duo-ctl: /, "")
+  }
+
+  function finishLoginFix(exitCode) {
+    root.busy = false
+    root.loginFixRunning = false
+    root.loginFixSucceeded = Number(exitCode) === 0 && root.loginFixError === ""
+    if (root.loginFixSucceeded) {
+      if (root.loginFixProgress < 100) root.loginFixProgress = 100
+      if (root.loginFixLabel === "" || root.loginFixLabel === "Waiting for authentication")
+        root.loginFixLabel = "Logout greeter is fixed."
+    } else if (root.loginFixError === "") {
+      root.loginFixError = "Authentication cancelled or install failed."
+    }
+    root.refresh()
+  }
+
+  function fixLoginScreen() {
+    if (root.busy || loginFixProc.running) return
+    root.lastError = ""
+    root.loginFixOpen = true
+    root.loginFixConfirming = true
+    root.loginFixRunning = false
+    root.loginFixSucceeded = false
+    root.loginFixProgress = 0
+    root.loginFixLabel = ""
+    root.loginFixError = ""
+  }
+
+  function beginLoginFix() {
+    if (!root.loginFixOpen || root.loginFixRunning || loginFixProc.running) return
+    root.loginFixConfirming = false
+    root.loginFixRunning = true
+    root.loginFixSucceeded = false
+    root.loginFixProgress = 5
+    root.loginFixLabel = "Waiting for authentication"
+    root.loginFixError = ""
+    root.busy = true
+    loginFixProc.running = false
+    loginFixProc.command = [root.ctl, "login-fix"]
+    loginFixProc.running = true
   }
 
   function ingest(raw) {
@@ -147,6 +215,40 @@ Panel {
     }
   }
 
+  Process {
+    id: loginFixProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var raw = String(text || "").trim()
+        if (raw !== "") root.ingest(raw)
+      }
+    }
+    stderr: SplitParser {
+      onRead: function(line) { root.handleLoginFixLine(line) }
+    }
+    onExited: function(exitCode) { root.finishLoginFix(exitCode) }
+  }
+
+  LoginFixOverlay {
+    anchorItem: root.anchorItem
+    fontFamily: root.contentFontFamily
+    foreground: root.contentForeground
+    open: root.loginFixOpen
+    confirming: root.loginFixConfirming
+    running: root.loginFixRunning
+    succeeded: root.loginFixSucceeded
+    progress: root.loginFixProgress
+    stepLabel: root.loginFixLabel
+    error: root.loginFixError
+    onConfirmRequested: root.beginLoginFix()
+    onDismissRequested: {
+      if (root.loginFixRunning) return
+      root.loginFixOpen = false
+      root.resetLoginFix()
+    }
+  }
+
   KeyboardPanel {
     id: panel
     anchorItem: root.anchorItem
@@ -208,6 +310,7 @@ Panel {
             Text {
               text: {
                 if (!root.status.isDuo) return "NOT A GPD DUO"
+                if (root.loginFixRunning) return "FIXING LOGIN SCREEN"
                 if (root.busy) return "APPLYING"
                 var live = Model.modeLabel(root.status.mode).toUpperCase()
                 if (root.status.saved) return live + " · SAVED"
@@ -349,6 +452,17 @@ Panel {
             font.family: root.contentFontFamily
             font.pixelSize: Style.font.caption
             wrapMode: Text.WordWrap
+            maximumLineCount: 4
+            elide: Text.ElideRight
+          }
+
+          Text {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: "Touch and stylus mapping are not handled yet."
+            color: Qt.darker(root.contentForeground, 1.4)
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
           }
         }
 
@@ -363,14 +477,19 @@ Panel {
           onClicked: root.saveLayout()
         }
 
-        Text {
+        Button {
           width: parent.width
           visible: root.status.isDuo
-          wrapMode: Text.WordWrap
-          text: "Touch and stylus mapping are not handled yet."
-          color: Qt.darker(root.contentForeground, 1.4)
-          font.family: root.contentFontFamily
-          font.pixelSize: Style.font.caption
+          text: {
+            if (!root.status.loginFixed) return "Fix login screen orientation"
+            if (root.status.loginFixNeedsReboot) return "Login fix installed · reboot to finish"
+            return "Login screen orientation is fixed"
+          }
+          bordered: true
+          foreground: root.contentForeground
+          fontFamily: root.contentFontFamily
+          enabled: !root.busy
+          onClicked: root.fixLoginScreen()
         }
       }
     }

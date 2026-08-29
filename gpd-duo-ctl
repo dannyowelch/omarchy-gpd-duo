@@ -10,13 +10,37 @@ STATE_FILE="$STATE_DIR/gpd-duo.json"
 MONITORS_LUA="${XDG_CONFIG_HOME:-$HOME/.config}/hypr/monitors.lua"
 LAYOUT_TOGGLE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/toggles/hypr/gpd-duo-layout.lua"
 SLIDERS_TOGGLE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/toggles/hypr/gpd-duo-sliders.lua"
+GREETER_LUA="/etc/sddm/gpd-duo-hyprland.lua"
+GREETER_COMPOSITOR="/etc/sddm/gpd-duo-compositor"
+GREETER_SDDM_CONF="/etc/sddm.conf.d/20-gpd-duo.conf"
+LIMINE_DROPIN="/etc/limine-entry-tool.d/gpd-duo.conf"
+UKI_STAMP="/etc/sddm/gpd-duo-uki.stamp"
+LOGIN_FIX_LOG="/var/tmp/gpd-duo-login-fix.log"
+PLYMOUTH_THEME_DIR="/usr/share/plymouth/themes/gpd-duo"
+UKI_STAMP_VALUE="sddm-greeter-v1-stock-plymouth"
+PANEL_ORIENT_PARAM="video=eDP-1:panel_orientation=upside_down"
+
+kernel_rotates_panel() {
+  grep -Fq 'panel_orientation=upside_down' /proc/cmdline
+}
+
+# Session always uses Hyprland transform 2. Kernel panel_orientation also
+# rotates KMS scanout on this AMD panel, so that cmdline must not be live
+# at the same time or pixels and the pointer disagree.
+lower_transform() {
+  echo 2
+}
 
 usage() {
   cat <<USAGE
-Usage: gpd-duo-ctl <detect|status|apply|save|boot|sliders> [arg]
+Usage: gpd-duo-ctl <detect|status|apply|save|boot|sliders|login-fix> [arg]
 
 Layout modes: dual, lower
 Sliders: on, off, toggle
+
+login-fix writes an SDDM greeter config so the logout screen is
+rotated. The first screen after reboot stays stock Omarchy
+(lower inverted, lid upright). Prompts for privileges.
 
 The lid display only works while the main (lower) panel is enabled,
 so upper-only and tablet layouts are not offered.
@@ -26,6 +50,17 @@ USAGE
 fail() {
   echo "gpd-duo-ctl: $*" >&2
   exit 1
+}
+
+# Line-oriented progress for the panel overlay. stderr stays unbuffered
+# when piped, unlike stdout, so the overlay can update during limine-update.
+emit_progress() {
+  local step="$1" label="$2" pct="$3"
+  printf 'GPDDUO_PROGRESS\t%s\n' "$(jq -nc \
+    --arg step "$step" \
+    --arg label "$label" \
+    --argjson pct "$pct" \
+    '{type:"progress",step:$step,label:$label,pct:$pct}')" >&2
 }
 
 need() {
@@ -243,13 +278,18 @@ detect_payload() {
 }
 
 status_payload() {
-  local detect mode last saved sliders slider_dev
+  local detect mode last saved sliders slider_dev login_fixed
   detect=$(detect_payload)
   mode=$(infer_mode "$(jq -c '.lower' <<<"$detect")" "$(jq -c '.upper' <<<"$detect")")
   last=$(jq -r '.lastMode // ""' <<<"$(read_state)")
   saved=$(jq -r '.savedMode // ""' <<<"$(read_state)")
   sliders=$(sliders_from_state)
   slider_dev=$(slider_keyboard)
+  if login_is_fixed; then login_fixed=true; else login_fixed=false; fi
+  local needs_reboot=false
+  if [[ $login_fixed == true ]] && kernel_rotates_panel; then
+    needs_reboot=true
+  fi
   jq -n \
     --argjson detect "$detect" \
     --arg mode "$mode" \
@@ -257,13 +297,17 @@ status_payload() {
     --arg savedMode "$saved" \
     --argjson touchpadSliders "$sliders" \
     --arg sliderDevice "$slider_dev" \
+    --argjson loginFixed "$login_fixed" \
+    --argjson loginFixNeedsReboot "$needs_reboot" \
     '$detect + {
       mode:$mode,
       lastMode:$lastMode,
       savedMode:$savedMode,
       saved:($savedMode != "" and $savedMode == $lastMode and $lastMode == $mode),
       touchpadSliders:$touchpadSliders,
-      sliderDevice:(if $sliderDevice == "" then null else $sliderDevice end)
+      sliderDevice:(if $sliderDevice == "" then null else $sliderDevice end),
+      loginFixed:$loginFixed,
+      loginFixNeedsReboot:$loginFixNeedsReboot
     }'
 }
 
@@ -337,21 +381,22 @@ apply_mode() {
   lmode="${lw}x${lh}@${lr}"
   umode="${uw}x${uh}@${ur}"
 
-  local stack_y overlay
-  read -r _ stack_y <<<"$(logical_size "$lw" "$lh" "$scale" 2)"
+  local l_transform stack_y overlay
+  l_transform=$(lower_transform)
+  read -r _ stack_y <<<"$(logical_size "$lw" "$lh" "$scale" "$l_transform")"
 
   # hyprctl eval cannot re-enable a disabled output under Omarchy's Lua
   # parser. Write a toggle overlay (sourced after monitors.lua) and reload.
   case "$requested" in
     dual)
       overlay=$(
-        lua_monitor "$lname" false "$lmode" "0x0" "$scale" 2
+        lua_monitor "$lname" false "$lmode" "0x0" "$scale" "$l_transform"
         lua_monitor "$uname" false "$umode" "0x-${stack_y}" "$scale" 0
       )
       ;;
     lower)
       overlay=$(
-        lua_monitor "$lname" false "$lmode" "0x0" "$scale" 2
+        lua_monitor "$lname" false "$lmode" "0x0" "$scale" "$l_transform"
         lua_monitor "$uname" true
       )
       ;;
@@ -454,19 +499,20 @@ save_layout() {
   scale=$(awk -v a="$ls" -v b="$us" 'BEGIN { s = a + 0; if (s <= 0) s = b + 0; if (s <= 0) s = 2; printf "%g", s }')
   local gdk
   gdk=$(awk -v s="$scale" 'BEGIN { printf "%d", int(s + 0.5) }')
-  local stack_y
-  read -r _ stack_y <<<"$(logical_size "$lw" "$lh" "$scale" 2)"
+  local l_transform stack_y
+  l_transform=$(lower_transform)
+  read -r _ stack_y <<<"$(logical_size "$lw" "$lh" "$scale" "$l_transform")"
 
-  local l_disabled u_disabled l_transform u_transform l_pos u_pos
+  local l_disabled u_disabled u_transform l_pos u_pos
   case "$mode" in
     dual)
       l_disabled=false; u_disabled=false
-      l_transform=2; u_transform=0
+      u_transform=0
       l_pos="0x0"; u_pos="0x-${stack_y}"
       ;;
     lower)
       l_disabled=false; u_disabled=true
-      l_transform=2; u_transform=0
+      u_transform=0
       l_pos="0x0"; u_pos="0x0"
       ;;
     *)
@@ -504,23 +550,240 @@ EOF
 
 boot() {
   is_duo || exit 0
-  local detect lower transform last saved
+  local detect lower transform last saved want mode
   detect=$(detect_payload)
   lower=$(jq -c '.lower' <<<"$detect")
   [[ $lower != null ]] || exit 0
   transform=$(jq -r '.transform // 0' <<<"$lower")
   saved=$(jq -r '.savedMode // ""' <<<"$(read_state)")
   last=$(jq -r '.lastMode // ""' <<<"$(read_state)")
+  want=$(lower_transform)
 
-  # First-run only: the main OLED is physically inverted. If the user has
-  # already picked a layout, leave Hyprland and monitors.lua alone.
-  if [[ -z $saved && -z $last ]]; then
-    if jq -e '.disabled | not' <<<"$lower" >/dev/null && [[ $transform != 2 ]]; then
-      apply_mode dual >/dev/null
+  # Do not apply transform 2 while the kernel is still rotating scanout;
+  # that combination inverts the image. Heal on the next boot after the
+  # panel_orientation cmdline is gone.
+  if kernel_rotates_panel; then
+    boot_sliders
+    return
+  fi
+
+  if [[ $transform != "$want" ]]; then
+    mode=$last
+    if [[ $mode != dual && $mode != lower ]]; then
+      mode=$saved
+    fi
+    if [[ $mode != dual && $mode != lower ]]; then
+      mode=$(infer_mode "$(jq -c '.lower' <<<"$detect")" "$(jq -c '.upper' <<<"$detect")")
+    fi
+    if [[ $mode == dual || $mode == lower ]]; then
+      if [[ $saved == dual || $saved == lower ]]; then
+        save_layout >/dev/null
+      else
+        apply_mode "$mode" >/dev/null
+      fi
+    elif [[ -z $saved && -z $last ]]; then
+      if jq -e '.disabled | not' <<<"$lower" >/dev/null; then
+        apply_mode dual >/dev/null
+      fi
     fi
   fi
 
   boot_sliders
+}
+
+login_is_fixed() {
+  [[ -f $GREETER_LUA && -f $GREETER_SDDM_CONF ]] || return 1
+  grep -Fq 'transform = 2' "$GREETER_LUA" || return 1
+  grep -Fq "$GREETER_LUA" "$GREETER_SDDM_CONF" || return 1
+  if [[ -f $LIMINE_DROPIN ]] && grep -Fq "$PANEL_ORIENT_PARAM" "$LIMINE_DROPIN"; then
+    return 1
+  fi
+  if grep -Fq 'Theme=gpd-duo' /etc/plymouth/plymouthd.conf 2>/dev/null; then
+    return 1
+  fi
+  [[ ! -d $PLYMOUTH_THEME_DIR ]] || return 1
+  return 0
+}
+
+restore_plymouth_default() {
+  local changed=false
+  if grep -Fq 'Theme=gpd-duo' /etc/plymouth/plymouthd.conf 2>/dev/null; then
+    command -v plymouth-set-default-theme >/dev/null || fail "plymouth-set-default-theme is missing"
+    plymouth-set-default-theme omarchy
+    changed=true
+  fi
+  if [[ -e $PLYMOUTH_THEME_DIR ]]; then
+    rm -rf "$PLYMOUTH_THEME_DIR"
+    changed=true
+  fi
+  [[ $changed == true ]]
+}
+
+login_progress_from_limine() {
+  local line="$1"
+  case "$line" in
+    *"Running build hook"*)
+      LOGIN_FIX_HOOK_PCT=${LOGIN_FIX_HOOK_PCT:-55}
+      LOGIN_FIX_HOOK_PCT=$((LOGIN_FIX_HOOK_PCT + 2))
+      if (( LOGIN_FIX_HOOK_PCT > 82 )); then LOGIN_FIX_HOOK_PCT=82; fi
+      local hook
+      hook=$(sed -n 's/.*\[\(.*\)\].*/\1/p' <<<"$line" | tail -n 1)
+      emit_progress uki "Initramfs: ${hook:-running hooks}" "$LOGIN_FIX_HOOK_PCT"
+      ;;
+    *"limine-install"*|*"Installing Limine"*|*"Limine binaries"*)
+      emit_progress uki "Installing bootloader" 45
+      ;;
+    *"Building image"*|*"Starting build"*)
+      emit_progress uki "Building initramfs" 55
+      ;;
+    *"UKI"*|*"unified kernel"*|*"Creating zstd"*|*"Creating gzip"*)
+      emit_progress uki "Creating boot image" 88
+      ;;
+    *"Image generation successful"*|*"Image generated"*)
+      emit_progress uki "Boot image ready" 94
+      ;;
+  esac
+}
+
+run_limine_update() {
+  local status
+  emit_progress uki "Rebuilding boot image" 40
+  LOGIN_FIX_HOOK_PCT=55
+
+  set +o pipefail
+  if command -v stdbuf >/dev/null; then
+    stdbuf -oL -eL limine-update 2>&1
+  else
+    limine-update 2>&1
+  fi | tee "$LOGIN_FIX_LOG" | while IFS= read -r line || [[ -n $line ]]; do
+    login_progress_from_limine "$line"
+  done
+  status=${PIPESTATUS[0]}
+  set -o pipefail
+
+  if [[ $status -ne 0 ]]; then
+    fail "boot image rebuild failed"
+  fi
+  emit_progress uki "Boot image rebuilt" 96
+}
+
+# Always dual: both OLEDs on, lower rotated 180°, same scale. SDDM's greeter
+# Hyprland does not read monitors.lua, so the session layout never applies.
+generate_greeter_lua() {
+  local detect lower upper lname uname
+  detect=$(detect_payload)
+  jq -e '.isDuo == true' <<<"$detect" >/dev/null || fail "this machine is not a GPD Duo"
+  lower=$(jq -c '.lower' <<<"$detect")
+  upper=$(jq -c '.upper' <<<"$detect")
+  [[ $lower != null ]] || fail "could not find the lower display (eDP)"
+  [[ $upper != null ]] || fail "could not find the upper display (Stargate / DP)"
+
+  local lw lh lr ls lt uw uh ur us ut scale stack_y
+  lname=$(jq -r '.name' <<<"$lower")
+  uname=$(jq -r '.name' <<<"$upper")
+  read -r lw lh lr ls lt <<<"$(geometry "$lower")"
+  read -r uw uh ur us ut <<<"$(geometry "$upper")"
+  scale=$(awk -v a="$ls" -v b="$us" 'BEGIN { s = a + 0; if (s <= 0) s = b + 0; if (s <= 0) s = 2; printf "%g", s }')
+  read -r _ stack_y <<<"$(logical_size "$lw" "$lh" "$scale" 2)"
+
+  cat <<EOF
+-- Written by ${PLUGIN_ID}. SDDM greeter compositor config for the GPD Duo.
+-- The lower OLED is physically inverted. Both panels get the same scale
+-- because the lid EDID reports a different size than the main panel.
+
+hl.config({
+  misc = {
+    disable_hyprland_logo = true,
+    disable_splash_rendering = true,
+    force_default_wallpaper = 0,
+  },
+  animations = {
+    enabled = false,
+  },
+})
+
+EOF
+  lua_monitor "$lname" false "${lw}x${lh}@${lr}" "0x0" "$scale" 2
+  lua_monitor "$uname" false "${uw}x${uh}@${ur}" "0x-${stack_y}" "$scale" 0
+  printf 'hl.monitor({ output = "", mode = "preferred", position = "auto", scale = %s })\n' "$scale"
+}
+
+self_path() {
+  readlink -f "$0"
+}
+
+# Root-only. Writes the SDDM greeter config and restores stock Plymouth
+# if a Duo splash was previously installed. Called via pkexec/sudo.
+login_install() {
+  local src="${1:-}"
+  [[ $EUID -eq 0 ]] || fail "login-install must run as root"
+  [[ -n $src && -f $src ]] || fail "login-install requires a greeter config file"
+
+  mkdir -p /etc/sddm /etc/sddm.conf.d
+  emit_progress greeter "Writing greeter config" 22
+  install -m 644 "$src" "$GREETER_LUA"
+  rm -f "$GREETER_COMPOSITOR"
+  cat >"$GREETER_SDDM_CONF" <<EOF
+# Written by ${PLUGIN_ID}.
+[Wayland]
+CompositorCommand=start-hyprland -- --config ${GREETER_LUA}
+EOF
+  chmod 644 "$GREETER_SDDM_CONF"
+
+  local rebuild=false
+  emit_progress plymouth "Restoring default boot splash" 32
+  if restore_plymouth_default; then
+    rebuild=true
+  fi
+  if [[ -f $LIMINE_DROPIN ]]; then
+    rm -f "$LIMINE_DROPIN"
+    rebuild=true
+  fi
+  if [[ ! -f $UKI_STAMP || $(cat "$UKI_STAMP") != "$UKI_STAMP_VALUE" ]]; then
+    rebuild=true
+  fi
+  if [[ $rebuild == false ]]; then
+    emit_progress done "Logout greeter is fixed." 100
+    return 0
+  fi
+  command -v limine-update >/dev/null || fail "limine-update is missing; cannot restore the default boot splash"
+  run_limine_update
+  printf '%s\n' "$UKI_STAMP_VALUE" >"$UKI_STAMP"
+  chmod 644 "$UKI_STAMP"
+  emit_progress done "Restored the default boot splash. Reboot once." 100
+}
+
+run_elevated() {
+  local self
+  self=$(self_path)
+  if [[ $EUID -eq 0 ]]; then
+    fail "run login-fix as your user; it will prompt for privileges"
+  fi
+  if [[ -t 0 && -t 1 ]] && command -v sudo >/dev/null; then
+    sudo "$self" "$@"
+  else
+    command -v pkexec >/dev/null || fail "need pkexec or sudo to install the login screen fix"
+    pkexec "$self" "$@"
+  fi
+}
+
+login_fix() {
+  local tmp
+  [[ $EUID -ne 0 ]] || fail "run login-fix as your user; it will prompt for privileges"
+
+  emit_progress auth "Waiting for authentication" 8
+  tmp=$(mktemp /tmp/gpd-duo-greeter.XXXXXX.lua)
+  if ! generate_greeter_lua >"$tmp"; then
+    rm -f "$tmp"
+    fail "could not generate the login screen config"
+  fi
+  emit_progress install "Installing greeter config" 16
+  if ! run_elevated login-install "$tmp"; then
+    rm -f "$tmp"
+    fail "authentication cancelled or install failed"
+  fi
+  rm -f "$tmp"
+  status_payload
 }
 
 need hyprctl
@@ -540,6 +803,11 @@ case "$cmd" in
     apply_sliders "$2" | jq -c .
     ;;
   boot) boot ;;
+  login-preview) generate_greeter_lua ;;
+  login-fix) login_fix | jq -c . ;;
+  login-install)
+    login_install "${2:-}"
+    ;;
   -h|--help) usage ;;
   *)
     usage >&2

@@ -71,6 +71,11 @@ BarWidget {
       return "ok"
     }
 
+    function loginFix(): string {
+      if (panelLoader.item) panelLoader.item.fixLoginScreen()
+      return "ok"
+    }
+
     function refresh(): void {
       if (panelLoader.item) panelLoader.item.refresh()
     }
